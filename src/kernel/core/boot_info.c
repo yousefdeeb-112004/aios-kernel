@@ -1,0 +1,7 @@
+#include <kernel/boot_info.h>
+#include <kernel/multiboot.h>
+#include <drivers/vga.h>
+extern uint32_t _kernel_start; extern uint32_t _kernel_end;
+boot_info_t g_boot_info;
+void boot_info_init(uint32_t magic,void*ptr){multiboot_info_t*mbi=(multiboot_info_t*)ptr;g_boot_info.magic=BOOT_INFO_MAGIC;if(magic!=MULTIBOOT_MAGIC){g_boot_info.multiboot_valid=0;return;}g_boot_info.multiboot_valid=1;if(mbi->flags&MULTIBOOT_FLAG_MEM){g_boot_info.mem_lower_kb=mbi->mem_lower;g_boot_info.mem_upper_kb=mbi->mem_upper;g_boot_info.total_memory_kb=mbi->mem_lower+mbi->mem_upper;}g_boot_info.boot_device=(mbi->flags&MULTIBOOT_FLAG_BOOTDEV)?mbi->boot_device:0xFFFFFFFF;g_boot_info.kernel_start=(uint32_t)&_kernel_start;g_boot_info.kernel_end=(uint32_t)&_kernel_end;g_boot_info.kernel_size_kb=(g_boot_info.kernel_end-g_boot_info.kernel_start)/1024;if(mbi->flags&MULTIBOOT_FLAG_MMAP){uint32_t c=0,o=0;while(o<mbi->mmap_length){multiboot_mmap_entry_t*e=(multiboot_mmap_entry_t*)(mbi->mmap_addr+o);c++;o+=e->size+sizeof(e->size);}g_boot_info.mmap_entries=c;}g_boot_info.ai_features=AI_ENABLED;}
+void boot_info_dump(void){vga_puts_color("Boot: ",VGA_LIGHT_CYAN,VGA_BLACK);if(g_boot_info.multiboot_valid)vga_puts_color("OK",VGA_LIGHT_GREEN,VGA_BLACK);else vga_puts_color("FAIL",VGA_LIGHT_RED,VGA_BLACK);vga_puts(" Mem:");vga_put_dec(g_boot_info.total_memory_kb/1024);vga_puts("MB AI:");if(g_boot_info.ai_features)vga_puts_color("ON",VGA_LIGHT_GREEN,VGA_BLACK);else vga_puts("OFF");vga_puts("\n");}
