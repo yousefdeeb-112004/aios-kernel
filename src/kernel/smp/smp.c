@@ -207,6 +207,105 @@ static uint32_t mp_find_cpus(void) {
 }
 
 /* =========================================================================
+ * ACPI MADT enumeration (preferred — modern QEMU only lists every core here,
+ * not in the legacy MP table). Walks RSDP -> RSDT -> MADT ("APIC") and records
+ * each enabled Processor Local APIC into g_smp.cpus[].
+ * ========================================================================= */
+
+/* ACPI 1.0 Root System Description Pointer (20 bytes) */
+typedef struct {
+    char     signature[8];   /* "RSD PTR " */
+    uint8_t  checksum;
+    char     oem_id[6];
+    uint8_t  revision;       /* 0 = ACPI 1.0 (use 32-bit rsdt_addr) */
+    uint32_t rsdt_addr;
+} __attribute__((packed)) acpi_rsdp_t;
+
+/* Common ACPI System Description Table header (36 bytes) */
+typedef struct {
+    char     signature[4];
+    uint32_t length;
+    uint8_t  revision;
+    uint8_t  checksum;
+    char     oem_id[6];
+    char     oem_table_id[8];
+    uint32_t oem_revision;
+    uint32_t creator_id;
+    uint32_t creator_revision;
+} __attribute__((packed)) acpi_sdt_t;
+
+/* Identity-map every page spanning [phys, phys+size) so we can read tables that
+ * live above the 32MB the kernel maps at boot (QEMU puts ACPI near top of RAM).
+ * This is the same vmm_map_page() path already used for the LAPIC MMIO below. */
+static void acpi_map(uint32_t phys, uint32_t size) {
+    uint32_t start = phys & ~(PAGE_SIZE - 1);
+    uint32_t end   = (phys + size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    for (uint32_t p = start; p < end; p += PAGE_SIZE)
+        vmm_map_page(p, p, PTE_PRESENT | PTE_WRITABLE);
+}
+
+static acpi_rsdp_t* acpi_find_rsdp(void) {
+    /* 1. First KB of the EBDA */
+    uint16_t ebda_seg = *(uint16_t*)0x040E;
+    if (ebda_seg) {
+        uint32_t ebda = (uint32_t)ebda_seg << 4;
+        for (uint32_t a = ebda; a < ebda + 1024; a += 16)
+            if (memcmp((void*)a, "RSD PTR ", 8) == 0) return (acpi_rsdp_t*)a;
+    }
+    /* 2. BIOS ROM area 0xE0000-0xFFFFF (16-byte aligned) */
+    for (uint32_t a = 0xE0000; a < 0x100000; a += 16)
+        if (memcmp((void*)a, "RSD PTR ", 8) == 0) return (acpi_rsdp_t*)a;
+    return NULL;
+}
+
+/* Returns number of enabled CPUs found via ACPI, or 0 if no MADT is available. */
+static uint32_t acpi_find_cpus(void) {
+    acpi_rsdp_t* rsdp = acpi_find_rsdp();
+    if (!rsdp || !rsdp->rsdt_addr) return 0;
+
+    uint32_t rsdt_phys = rsdp->rsdt_addr;
+    acpi_map(rsdt_phys, sizeof(acpi_sdt_t));
+    acpi_sdt_t* rsdt = (acpi_sdt_t*)rsdt_phys;
+    if (memcmp(rsdt->signature, "RSDT", 4) != 0) return 0;
+    acpi_map(rsdt_phys, rsdt->length);
+
+    /* RSDT body is an array of 32-bit physical pointers to other tables */
+    uint32_t  n_entries = (rsdt->length - sizeof(acpi_sdt_t)) / 4;
+    uint32_t* entries   = (uint32_t*)(rsdt_phys + sizeof(acpi_sdt_t));
+
+    for (uint32_t i = 0; i < n_entries; i++) {
+        uint32_t tbl = entries[i];
+        if (!tbl) continue;
+        acpi_map(tbl, sizeof(acpi_sdt_t));
+        acpi_sdt_t* h = (acpi_sdt_t*)tbl;
+        if (memcmp(h->signature, "APIC", 4) != 0) continue;  /* want the MADT */
+
+        acpi_map(tbl, h->length);
+        uint32_t count = 0;
+        /* MADT entries begin after the SDT header + local_apic_addr(4) + flags(4) */
+        uint8_t* p   = (uint8_t*)(tbl + sizeof(acpi_sdt_t) + 8);
+        uint8_t* end = (uint8_t*)(tbl + h->length);
+        while (p + 2 <= end) {
+            uint8_t etype = p[0];
+            uint8_t elen  = p[1];
+            if (elen < 2) break;  /* malformed — avoid infinite loop */
+            if (etype == 0) {     /* Processor Local APIC: id, apic_id, flags */
+                uint8_t  apic_id = p[3];
+                uint32_t flags   = *(uint32_t*)(p + 4);
+                if ((flags & 1) && count < MAX_CPUS) {  /* bit0 = enabled */
+                    g_smp.cpus[count].apic_id = apic_id;
+                    g_smp.cpus[count].is_bsp  = false;  /* set later by bsp_id match */
+                    count++;
+                }
+            }
+            p += elen;
+        }
+        return count;
+    }
+    return 0;  /* no MADT in RSDT */
+}
+
+/* =========================================================================
  * AP Entry Point (called by trampoline after switching to pmode)
  * ========================================================================= */
 
@@ -340,8 +439,12 @@ void smp_init(void) {
 
     uint32_t bsp_id = lapic_id();
 
-    /* Find CPUs via MP tables */
-    g_smp.cpu_count = mp_find_cpus();
+    /* Find CPUs. Prefer ACPI MADT: modern QEMU/SeaBIOS only enumerates every core
+     * there and stubs the legacy MP table at a single CPU. Fall back to the MP
+     * table for firmware that lacks ACPI. */
+    g_smp.cpu_count = acpi_find_cpus();
+    if (g_smp.cpu_count == 0)
+        g_smp.cpu_count = mp_find_cpus();
 
     /* If MP tables didn't populate, set BSP manually */
     if (g_smp.cpu_count == 0) {
@@ -376,16 +479,20 @@ void smp_init(void) {
     gdtp->limit = sizeof(trampoline_gdt) - 1;
     gdtp->base = (uint32_t)trampoline_gdt;
 
-    /* Wake each AP */
+    /* Wake each AP, one at a time. The trampoline handoff slots at 0x8FF0 (stack)
+     * and 0x8FF4 (entry) are shared, so we must wait for each AP to consume them
+     * (i.e. come online) before reusing them for the next AP. */
     for (uint32_t i = 0; i < g_smp.cpu_count; i++) {
         if (g_smp.cpus[i].is_bsp) continue;  /* Skip BSP */
         if (g_smp.cpus[i].apic_id == bsp_id) continue;
 
+        uint32_t before = g_smp.cpus_online;
         wake_ap(g_smp.cpus[i].apic_id, i);
-    }
 
-    /* Wait for APs to come online */
-    pit_sleep_ms(100);
+        /* Wait up to ~100ms for this AP to report in before waking the next */
+        for (int t = 0; t < 100 && g_smp.cpus_online == before; t++)
+            pit_sleep_ms(1);
+    }
 
     g_smp.smp_enabled = (g_smp.cpus_online > 1);
 }

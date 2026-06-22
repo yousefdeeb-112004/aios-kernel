@@ -1,7 +1,7 @@
 CC  = gcc
 AS  = gcc
 LD  = ld
-CFLAGS  = -m32 -ffreestanding -fno-builtin -fno-stack-protector -fno-omit-frame-pointer -nostdlib -nostdinc -mno-red-zone -Wall -Wextra -Wno-unused-parameter -Iinclude -c -g -DAI_FEATURES
+CFLAGS  = -m32 -std=gnu11 -Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -ffreestanding -fno-builtin -fno-stack-protector -fno-omit-frame-pointer -nostdlib -nostdinc -mno-red-zone -Wall -Wextra -Wno-unused-parameter -Iinclude -c -g -DAI_FEATURES
 ASFLAGS = -m32 -c -g
 LDFLAGS = -m elf_i386 -T linker.ld -nostdlib
 BUILD = build
