@@ -22,13 +22,17 @@ void vmm_init(void) {
     memset(&g_vmm_stats, 0, sizeof(vmm_stats_t));
     memset(page_dir, 0, sizeof(page_dir));
 
-    /* Identity-map first 32MB (8 page tables × 1024 pages × 4KB = 32MB) */
+    /* Identity-map first 32MB (8 page tables × 1024 pages × 4KB = 32MB).
+     * These are kernel pages: SUPERVISOR-ONLY (no PTE_USER). Ring 3 code
+     * therefore cannot read or write the kernel .text/.rodata/.data/.bss or
+     * any kernel working memory. User ELF programs get their own user-flagged
+     * pages in a private address space (see vmm_map_user_page). */
     for (int t = 0; t < 8; t++) {
         for (int i = 0; i < 1024; i++) {
-            first_pt[t][i] = (t * 1024 + i) * PAGE_SIZE | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+            first_pt[t][i] = (t * 1024 + i) * PAGE_SIZE | PTE_PRESENT | PTE_WRITABLE;
             g_vmm_stats.pages_mapped++;
         }
-        page_dir[t] = (uint32_t)&first_pt[t] | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+        page_dir[t] = (uint32_t)&first_pt[t] | PTE_PRESENT | PTE_WRITABLE;
     }
 
     g_vmm_stats.maps_created = g_vmm_stats.pages_mapped;
@@ -82,57 +86,106 @@ uint32_t vmm_get_kernel_page_dir(void) {
     return (uint32_t)page_dir;
 }
 
-/* Create a new address space for user-mode programs.
- * Allocates from the kernel heap (guaranteed within identity-mapped 32MB)
- * since pmm_alloc_page() could return pages above 32MB which aren't mapped.
- * Returns physical address of the new page directory. */
+/* ---- Isolated user address spaces ----------------------------------------
+ * User ELF programs run under their own page directory. The directory and its
+ * one private page table are drawn from a static, IDENTITY-MAPPED pool in the
+ * kernel image (BSS lives below the heap and is never remapped, so each
+ * structure's virtual address equals its physical address) — exactly what CR3
+ * and page-directory entries must contain. The kernel heap is NOT
+ * identity-mapped (heap_init remaps it onto arbitrary PMM frames), so kmalloc
+ * memory cannot be used to hold page tables.
+ *
+ * KNOWN TRAP: the user load region (~0x00500000) lives inside the kernel's
+ * shared page table first_pt[1], which is now supervisor-only. Punching a user
+ * page straight into first_pt[1] would re-expose kernel memory to Ring 3 in
+ * every address space (the table is shared). Instead each address space gets a
+ * PRIVATE copy of that 4MB region's page table: the kernel PTEs are copied
+ * verbatim (PTE_USER clear → still supervisor) and only the program's own PTEs
+ * get PTE_USER. The PDE gets PTE_USER set so those user PTEs are reachable (a
+ * page is user-accessible only when USER is set at BOTH levels, so the copied
+ * kernel PTEs stay supervisor regardless).
+ *
+ * This kernel loads every user program into the single 4MB region at
+ * 0x00500000 (one page-directory slot, see user.ld), so one private page table
+ * per address space is enough. */
+#define MAX_USER_AS 4
+
+static uint32_t user_pd_pool[MAX_USER_AS][1024] __attribute__((aligned(4096)));
+static uint32_t user_pt_pool[MAX_USER_AS][1024] __attribute__((aligned(4096)));
+static bool     user_as_used[MAX_USER_AS];
+static uint32_t user_as_pdi[MAX_USER_AS];   /* PDE that the private table backs */
+
+static int user_as_slot(uint32_t pd_phys) {
+    for (int i = 0; i < MAX_USER_AS; i++)
+        if (user_as_used[i] && (uint32_t)user_pd_pool[i] == pd_phys) return i;
+    return -1;
+}
+
+/* Create a new user address space cloned from the kernel's. Kernel page tables
+ * are shared and stay supervisor-only (PTE_USER was cleared in vmm_init), so
+ * Ring 3 cannot reach kernel memory even though the mappings remain present for
+ * Ring-0 syscall/IRQ handling under this CR3. Returns the page directory's
+ * physical address (== its virtual address; the pool is identity-mapped). */
 uint32_t vmm_create_address_space(void) {
-    /* Allocate page-aligned memory from heap (within identity-mapped region) */
-    uint32_t* new_pd = (uint32_t*)kmalloc(PAGE_SIZE + PAGE_SIZE);
-    if (!new_pd) return 0;
+    int slot = -1;
+    for (int i = 0; i < MAX_USER_AS; i++)
+        if (!user_as_used[i]) { slot = i; break; }
+    if (slot < 0) return 0;   /* pool exhausted */
 
-    /* Align to page boundary */
-    uint32_t addr = (uint32_t)new_pd;
-    uint32_t aligned = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    uint32_t* pd = (uint32_t*)aligned;
-    memset(pd, 0, PAGE_SIZE);
+    uint32_t* pd = user_pd_pool[slot];
+    memcpy(pd, page_dir, PAGE_SIZE);   /* clone all kernel mappings */
 
-    /* Clone kernel space: copy the first 8 page directory entries (first 32MB).
-     * These point to the SAME page tables, so kernel memory is shared. */
-    for (int i = 0; i < 8; i++) {
-        pd[i] = page_dir[i];
-    }
-
-    /* Also clone any other kernel mappings (LAPIC at 0xFEE00000, etc.) */
-    for (int i = 8; i < 1024; i++) {
-        if (page_dir[i] & PTE_PRESENT) {
-            pd[i] = page_dir[i];
-        }
-    }
-
+    user_as_used[slot] = true;
+    user_as_pdi[slot]  = 0xFFFFFFFF;
     g_vmm_stats.addr_spaces_created++;
     return (uint32_t)pd;
 }
 
-/* Destroy an address space. For heap-allocated page directories,
- * the memory will be freed when the process's heap is cleaned up.
- * We just free any process-specific page tables. */
-void vmm_destroy_address_space(uint32_t page_dir_phys) {
-    if (page_dir_phys == 0 || page_dir_phys == (uint32_t)page_dir) return;
+/* Map [virt -> phys] as a RING-3 (user-accessible) page into the address space
+ * whose page directory is at pd_phys. */
+void vmm_map_user_page(uint32_t pd_phys, uint32_t virt, uint32_t phys) {
+    int slot = user_as_slot(pd_phys);
+    if (slot < 0) return;
+    uint32_t pdi = virt >> 22;
+    uint32_t pti = (virt >> 12) & 0x3FF;
+    uint32_t* pd = user_pd_pool[slot];
+    uint32_t* pt = user_pt_pool[slot];
 
-    uint32_t* pd = (uint32_t*)page_dir_phys;
-
-    /* Free any process-specific page tables (above kernel range) */
-    for (int i = 8; i < 1024; i++) {
-        if (pd[i] & PTE_PRESENT) {
-            uint32_t pt_phys = pd[i] & 0xFFFFF000;
-            if ((page_dir[i] & 0xFFFFF000) != pt_phys) {
-                pmm_free_page(pt_phys);
-            }
-        }
+    if (user_as_pdi[slot] == 0xFFFFFFFF) {
+        /* First user page: seed the private table from the kernel's table for
+         * this 4MB region (keeps the rest supervisor), then splice it in with
+         * the PDE user bit set. */
+        if (page_dir[pdi] & PTE_PRESENT)
+            memcpy(pt, (void*)(page_dir[pdi] & 0xFFFFF000), PAGE_SIZE);
+        else
+            memset(pt, 0, PAGE_SIZE);
+        pd[pdi] = (uint32_t)pt | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+        user_as_pdi[slot] = pdi;
+    } else if (user_as_pdi[slot] != pdi) {
+        /* This kernel confines user pages to one 4MB region; refuse others. */
+        return;
     }
-    /* Note: the page directory itself was allocated with kmalloc,
-     * it gets freed via kfree in proc_kill */
+
+    pt[pti] = (phys & 0xFFFFF000) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+    __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+}
+
+/* Destroy a user address space: free the PMM frames backing the program (the
+ * PTE_USER entries we punched in; copied kernel PTEs are supervisor and are
+ * left alone) and return the pool slot. */
+void vmm_destroy_address_space(uint32_t pd_phys) {
+    if (pd_phys == 0 || pd_phys == (uint32_t)page_dir) return;
+    int slot = user_as_slot(pd_phys);
+    if (slot < 0) return;
+
+    if (user_as_pdi[slot] != 0xFFFFFFFF) {
+        uint32_t* pt = user_pt_pool[slot];
+        for (int j = 0; j < 1024; j++)
+            if ((pt[j] & PTE_PRESENT) && (pt[j] & PTE_USER))
+                pmm_free_page(pt[j] & 0xFFFFF000);
+    }
+    user_as_used[slot] = false;
+    user_as_pdi[slot]  = 0xFFFFFFFF;
 }
 
 /* Switch to a different address space by loading its page directory into CR3 */

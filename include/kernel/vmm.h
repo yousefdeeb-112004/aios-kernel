@@ -11,6 +11,7 @@ void vmm_unmap_page(uint32_t virt); uint32_t vmm_get_physical(uint32_t virt); vo
 
 /* Per-process address space support */
 uint32_t vmm_create_address_space(void);   /* Allocate new page dir with kernel mappings cloned */
+void     vmm_map_user_page(uint32_t page_dir_phys, uint32_t virt, uint32_t phys); /* Map a Ring-3 page */
 void     vmm_destroy_address_space(uint32_t page_dir_phys);
 void     vmm_switch_address_space(uint32_t page_dir_phys);
 uint32_t vmm_get_kernel_page_dir(void);    /* Get the kernel's page directory physical address */
