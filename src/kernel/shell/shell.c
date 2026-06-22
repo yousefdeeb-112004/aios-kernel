@@ -284,7 +284,7 @@ static void cmd_help(void) {
     vga_puts_color("  [IPC]", VGA_LIGHT_GREEN, VGA_BLACK);
     vga_puts(" anbb\n");
     vga_puts_color("  [Kernel]", VGA_LIGHT_GREEN, VGA_BLACK);
-    vga_puts(" usr shgl jrb mft\n");
+    vga_puts(" shgl jrb mft\n");
     vga_puts_color("  [Disk]", VGA_LIGHT_GREEN, VGA_BLACK);
     vga_puts(" qrs qra hfz tnsyq hfzk hmml dskfs\n");
     vga_puts_color("  [AI]", VGA_LIGHT_GREEN, VGA_BLACK);
@@ -316,7 +316,7 @@ static void cmd_help(void) {
     vga_puts_color("   khlf  Launch background task (non-blocking demo)\n", VGA_YELLOW, VGA_BLACK);
     vga_puts_color("   fzh <1|2|3>  Panic test (div0/pgfault/manual)\n", VGA_YELLOW, VGA_BLACK);
     vga_puts_color("  Kernel:\n", VGA_WHITE, VGA_BLACK);
-    vga_puts("   usr  Ring3 demo   shgl <f> Run ELF   jrb Preempt test\n");
+    vga_puts("   shgl <f> Run ELF (Ring 3, isolated)   jrb Preempt test\n");
     vga_puts_color("  Disk (persistent):\n", VGA_WHITE, VGA_BLACK);
     vga_puts("   qrs  Disk info    qra <n> Read sect  hfz <n> <t> Write\n");
     vga_puts_color("   tnsyq Format disk  hfzk Sync VFS->disk\n", VGA_YELLOW, VGA_BLACK);
@@ -556,11 +556,19 @@ static void cmd_nskhh(const char* arg) {
     if (vfs_exists(dst)) { vga_puts_color("Dest already exists.\n", theme_error, VGA_BLACK); return; }
     int32_t fd = vfs_open(src);
     if (fd < 0) return;
-    uint8_t tmp[VFS_FILE_MAXSZ];
+    /* Use a heap buffer, not the stack: VFS_FILE_MAXSZ (64KB) far exceeds the
+     * kernel stack and would smash it. */
+    uint8_t* tmp = (uint8_t*)kmalloc(VFS_FILE_MAXSZ);
+    if (!tmp) {
+        vfs_close(fd);
+        vga_puts_color("Out of memory.\n", theme_error, VGA_BLACK);
+        return;
+    }
     int32_t n = vfs_read(fd, tmp, VFS_FILE_MAXSZ);
     vfs_close(fd);
     if (n > 0) vfs_create(dst, tmp, n);
     else vfs_create_empty(dst);
+    kfree(tmp);
     vga_puts_color("Copied: ", VGA_LIGHT_GREEN, VGA_BLACK);
     vga_puts(src); vga_puts(" -> "); vga_puts(dst); vga_puts("\n");
 }
@@ -1446,8 +1454,6 @@ static void shell_exec(const char* line) {
         cmd_ms();
     } else if (strcmp(cmd, "wqf") == 0) {
         cmd_wqf();
-    } else if (strcmp(cmd, "usr") == 0) {
-        usermode_demo();
     } else if (strncmp(cmd, "shgl", 4) == 0 && (cmd[4] == ' ' || cmd[4] == '\0')) {
         const char* arg = skip_spaces(cmd + 4);
         if (!arg[0]) {

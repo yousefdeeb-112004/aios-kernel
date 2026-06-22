@@ -14,7 +14,4 @@
  * esp = user stack pointer (top of allocated user stack) */
 extern void jump_to_usermode(uint32_t eip, uint32_t esp);
 
-/* Create and run a demo user-mode program */
-void usermode_demo(void);
-
 #endif

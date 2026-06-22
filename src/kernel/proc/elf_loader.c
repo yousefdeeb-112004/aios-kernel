@@ -16,6 +16,8 @@
 #include <kernel/elf.h>
 #include <kernel/vfs.h>
 #include <kernel/heap.h>
+#include <kernel/pmm.h>
+#include <kernel/vmm.h>
 #include <kernel/process.h>
 #include <kernel/gdt.h>
 #include <kernel/usermode.h>
@@ -24,6 +26,11 @@
 #include <lib/string.h>
 
 #define USER_STACK_SIZE 4096
+
+/* User address-space layout (Ring 3). The program loads at 0x00500000
+ * (see src/user/user.ld); the user stack sits at the top of the low private
+ * region, clear of any plausible program size. */
+#define USER_STACK_TOP   0x00600000
 
 bool elf_validate(const elf32_header_t* hdr) {
     if (hdr->e_magic != ELF_MAGIC) {
@@ -97,8 +104,22 @@ static void elf_thread_fn(void) {
     vga_put_dec(hdr->e_phnum);
     vga_puts("\n");
 
-    /* Load PT_LOAD segments */
+    /* --- Build a private, isolated address space for this program ----------
+     * Kernel memory is supervisor-only (see vmm_init). We create a fresh
+     * address space, allocate brand-new physical frames for the program's
+     * code and stack, and map them user-accessible (PTE_USER) at their virtual
+     * addresses. The kernel stays cloned-in as supervisor for syscall/IRQ
+     * handling under this CR3, so Ring 3 can reach ONLY these user frames. */
+    uint32_t user_pd = vmm_create_address_space();
+    if (!user_pd) {
+        vga_puts_color("  ELF: address space alloc failed\n", VGA_LIGHT_RED, VGA_BLACK);
+        kfree(file_buf);
+        return;
+    }
+
+    /* Pass 1: validate PT_LOAD segments and find the page-aligned span. */
     uint32_t segments_loaded = 0;
+    uint32_t va_lo = 0xFFFFFFFF, va_hi = 0;
     for (uint16_t i = 0; i < hdr->e_phnum; i++) {
         elf32_phdr_t* ph = (elf32_phdr_t*)(file_buf + hdr->e_phoff +
                                              i * hdr->e_phentsize);
@@ -113,53 +134,87 @@ static void elf_thread_fn(void) {
         vga_put_dec(ph->p_filesz);
         vga_puts(" bytes)\n");
 
-        /* Bounds check: must be within our identity-mapped region (0-16MB) */
+        /* Bounds check: keep the program inside the low private region. */
         if (ph->p_vaddr + ph->p_memsz > 0x02000000) {
             vga_puts_color("  ELF: segment out of range!\n", VGA_LIGHT_RED, VGA_BLACK);
+            vmm_destroy_address_space(user_pd);
             kfree(file_buf);
             return;
         }
-
-        /* Copy file data to target address */
-        memcpy((void*)ph->p_vaddr, file_buf + ph->p_offset, ph->p_filesz);
-
-        /* Zero BSS (memsz > filesz) */
-        if (ph->p_memsz > ph->p_filesz) {
-            memset((void*)(ph->p_vaddr + ph->p_filesz), 0,
-                   ph->p_memsz - ph->p_filesz);
-        }
-
+        uint32_t lo = ph->p_vaddr & ~0xFFF;
+        uint32_t hi = (ph->p_vaddr + ph->p_memsz + 0xFFF) & ~0xFFF;
+        if (lo < va_lo) va_lo = lo;
+        if (hi > va_hi) va_hi = hi;
         segments_loaded++;
     }
 
     if (segments_loaded == 0) {
         vga_puts_color("  ELF: no loadable segments\n", VGA_LIGHT_RED, VGA_BLACK);
+        vmm_destroy_address_space(user_pd);
         kfree(file_buf);
         return;
     }
 
-    vga_puts_color("  Jumping to Ring 3...\n", VGA_LIGHT_GREEN, VGA_BLACK);
-
-    /* Save entry point BEFORE freeing — hdr points into file_buf! */
-    uint32_t entry_point = hdr->e_entry;
-
-    /* Free file buffer — segments are now copied to target addresses */
-    kfree(file_buf);
-
-    /* Allocate user stack */
-    void* ustack = kmalloc(USER_STACK_SIZE);
-    if (!ustack) {
-        vga_puts_color("  ELF: stack alloc failed\n", VGA_LIGHT_RED, VGA_BLACK);
+    /* Map fresh user frames for the code span and one user-stack page. */
+    for (uint32_t va = va_lo; va < va_hi; va += PAGE_SIZE) {
+        uint32_t frame = pmm_alloc_page();
+        if (!frame) {
+            vga_puts_color("  ELF: out of physical memory\n", VGA_LIGHT_RED, VGA_BLACK);
+            vmm_destroy_address_space(user_pd);
+            kfree(file_buf);
+            return;
+        }
+        vmm_map_user_page(user_pd, va, frame);
+    }
+    uint32_t ustack_page = USER_STACK_TOP - PAGE_SIZE;
+    uint32_t sframe = pmm_alloc_page();
+    if (!sframe) {
+        vga_puts_color("  ELF: out of physical memory\n", VGA_LIGHT_RED, VGA_BLACK);
+        vmm_destroy_address_space(user_pd);
+        kfree(file_buf);
         return;
     }
-    uint32_t user_esp = (uint32_t)ustack + USER_STACK_SIZE - 16;
+    vmm_map_user_page(user_pd, ustack_page, sframe);
 
-    /* Track user stack for cleanup on process exit */
-    proc_set_user_stack((uint32_t)ustack);
+    /* Save entry point BEFORE we switch away (hdr points into file_buf). */
+    uint32_t entry_point = hdr->e_entry;
+
+    /* Switch to the program's address space. The kernel thread keeps running:
+     * all kernel mappings are cloned (supervisor) into user_pd. Recording it
+     * in the PCB ensures the scheduler reloads this CR3 if we are preempted
+     * while in Ring 3. */
+    current_process->page_dir = user_pd;
+    vmm_switch_address_space(user_pd);
+
+    /* Pass 2: now that user frames are mapped, copy each segment in and zero
+     * its BSS. Ring 0 may write user pages; file_buf is kernel memory, still
+     * mapped supervisor under user_pd, so the source read is valid too. */
+    for (uint16_t i = 0; i < hdr->e_phnum; i++) {
+        elf32_phdr_t* ph = (elf32_phdr_t*)(file_buf + hdr->e_phoff +
+                                             i * hdr->e_phentsize);
+        if (ph->p_type != PT_LOAD) continue;
+        memcpy((void*)ph->p_vaddr, file_buf + ph->p_offset, ph->p_filesz);
+        if (ph->p_memsz > ph->p_filesz)
+            memset((void*)(ph->p_vaddr + ph->p_filesz), 0,
+                   ph->p_memsz - ph->p_filesz);
+    }
+    memset((void*)ustack_page, 0, PAGE_SIZE);
+
+    vga_puts_color("  Jumping to Ring 3 (isolated)...\n", VGA_LIGHT_GREEN, VGA_BLACK);
+
+    /* file_buf is kernel memory, still mapped under user_pd — free it. */
+    kfree(file_buf);
+
+    uint32_t user_esp = USER_STACK_TOP - 16;
+
+    /* Kernel stack for Ring 3 → Ring 0 transitions (syscalls/IRQs). */
     uint32_t kstack_top = current_process->stack_base + PROC_STACK_SIZE;
     tss_set_kernel_stack(kstack_top);
 
-    /* Jump to Ring 3 at ELF entry point! */
+    /* Jump to Ring 3 at the ELF entry point. The user frames are reclaimed via
+     * the address space on exit (vmm_destroy_address_space), so we deliberately
+     * do NOT register the stack with proc_set_user_stack (that path kfree()s a
+     * heap pointer; our stack is a PMM frame). */
     jump_to_usermode(entry_point, user_esp);
 }
 
