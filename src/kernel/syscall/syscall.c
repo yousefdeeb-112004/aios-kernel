@@ -3,6 +3,7 @@
 #include <kernel/process.h>
 #include <kernel/pmm.h>
 #include <kernel/heap.h>
+#include <kernel/usermode.h>
 #include <drivers/vga.h>
 #include <drivers/keyboard.h>
 #include <drivers/pit.h>
@@ -10,16 +11,35 @@
 
 syscall_stats_t g_syscall_stats;
 
+/* True iff the byte range [ptr, ptr+len) lies entirely inside the Ring 3 user
+ * region [USER_REGION_START, USER_STACK_TOP). Overflow-safe. An empty range
+ * (len == 0) dereferences nothing and is always accepted. Used to vet raw
+ * pointers handed to the kernel by user programs before they are dereferenced
+ * in Ring 0. */
+static bool user_range_ok(uint32_t ptr, uint32_t len) {
+    if (len == 0) return true;
+    if (ptr + len < ptr) return false;              /* integer overflow */
+    if (ptr < USER_REGION_START) return false;
+    if (ptr + len > USER_STACK_TOP) return false;
+    return true;
+}
+
 static void sh(registers_t* r) {
     uint32_t n = r->eax;
     uint32_t a1 = r->ebx;
     uint32_t a2 = r->ecx;
+
+    /* Pointer arguments are validated only for Ring 3 callers (saved CS RPL 3).
+     * Kernel threads reach these syscalls via the int 0x80 wrappers below and
+     * pass trusted kernel pointers, so they keep the original behavior. */
+    bool from_user = (r->cs & 3) == 3;
 
     g_syscall_stats.total++;
     if (n < SYS_MAX) g_syscall_stats.counts[n]++;
 
     switch (n) {
         case SYS_WRITE: {
+            if (from_user && !user_range_ok(a1, a2)) { r->eax = (uint32_t)-1; break; }
             const char* b = (const char*)a1;
             for (uint32_t i = 0; i < a2 && b[i]; i++)
                 vga_putchar(b[i]);
@@ -27,6 +47,7 @@ static void sh(registers_t* r) {
             break;
         }
         case SYS_READ: {
+            if (from_user && !user_range_ok(a1, a2)) { r->eax = (uint32_t)-1; break; }
             char* b = (char*)a1;
             uint32_t rd = 0;
             for (uint32_t i = 0; i < a2; i++) {
@@ -64,10 +85,21 @@ static void sh(registers_t* r) {
         case SYS_SIGNAL: {
             int signum = (int)a1;
             signal_handler_t handler = (signal_handler_t)a2;
+            /* SIG_DFL (0) and SIG_IGN (1) are sentinel values, not addresses.
+             * A real handler entry point must live in the user region. */
+            if (from_user && handler != SIG_DFL && handler != SIG_IGN &&
+                !user_range_ok((uint32_t)handler, 1)) {
+                r->eax = (uint32_t)-1;
+                break;
+            }
             r->eax = (uint32_t)proc_sigaction(signum, handler);
             break;
         }
         case SYS_GETSTATS: {
+            if (from_user && !user_range_ok(a1, sizeof(system_stats_t))) {
+                r->eax = (uint32_t)-1;
+                break;
+            }
             system_stats_t* s = (system_stats_t*)a1;
             if (s) {
                 s->uptime_seconds = pit_get_uptime();
