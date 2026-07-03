@@ -1,11 +1,14 @@
 /* =============================================================================
  * AI Agent Runtime — Tier 3.2
  *
- * The AI agent observes kernel metrics and applies simple heuristic rules
- * to detect anomalies, predict actions, and generate recommendations.
+ * The AI agent observes kernel metrics to detect anomalies, predict actions,
+ * and generate recommendations.
  *
- * This is a rule-based AI (not ML) — it uses threshold comparisons,
- * trend analysis, and pattern matching on the data from Phase 8.
+ * It is rule-based (threshold comparisons, trend analysis, pattern matching on
+ * the Phase 8 data) WITH ONE Bayesian (Beta-Bernoulli) node: the memory-leak
+ * detector. That node maintains a real posterior probability learned from
+ * sampled evidence — P = alpha/(alpha+beta) — instead of a fixed threshold.
+ * Every other detector is still a hand-tuned rule. No overclaiming: one node.
  * ============================================================================= */
 
 #include <ai/agent.h>
@@ -25,6 +28,10 @@
 #include <lib/string.h>
 
 ai_agent_t g_ai_agent;
+
+/* Beta-Bernoulli decay period: halve (alpha,beta) every this many windows so
+ * the memory-leak posterior forgets stale evidence (non-stationarity). */
+#define ML_DECAY_WINDOWS 64
 
 /* Anomaly names */
 static const char* anomaly_names[] = {
@@ -50,6 +57,10 @@ void ai_agent_init(void) {
     g_ai_agent.start_tick = pit_get_ticks();
     g_ai_agent.current_prediction = PREDICT_NONE;
 
+    /* Beta-Bernoulli prior: alpha = beta = 1 (uniform, Laplace smoothing). */
+    g_ai_agent.ml_alpha = 1;
+    g_ai_agent.ml_beta  = 1;
+
     /* Subscribe to all event types */
     ai_subscribe(AI_EVT_PROCESS_CREATE, agent_event_handler);
     ai_subscribe(AI_EVT_PROCESS_EXIT, agent_event_handler);
@@ -66,10 +77,52 @@ void ai_agent_check_anomalies(void) {
     for (int i = 0; i < ANOMALY_MAX; i++)
         g_ai_agent.anomalies[i] = false;
 
-    /* 1. Memory leak: allocs growing faster than frees */
+    /* 1. Memory leak — Beta-Bernoulli node (the one LEARNED detector) ---------
+     *
+     * Evidence variable E for this sampling window (one per check call):
+     *     E = (heap in-use bytes GREW) AND (allocs outpaced frees)
+     * Both signals come only from data the agent already samples via
+     * g_heap_stats (no new instrumentation): total_allocated is current
+     * in-use bytes; alloc_count/free_count are cumulative.
+     *
+     * We keep a Beta posterior over the leak probability. alpha counts windows
+     * where E held, beta where it did not; both start at 1 (Laplace smoothing),
+     * so alpha = 1 + #E and beta = 1 + #notE at all times. The reported
+     * probability is the posterior mean P = alpha/(alpha+beta), evaluated in
+     * fixed-point permille: P_permille = alpha*1000/(alpha+beta). NO floats. */
     uint32_t alloc_delta = g_heap_stats.alloc_count - g_ai_agent.prev_alloc_count;
-    uint32_t free_delta = g_heap_stats.free_count - g_ai_agent.prev_free_count;
-    if (alloc_delta > free_delta + 5 && g_heap_stats.alloc_count > 20) {
+    uint32_t free_delta  = g_heap_stats.free_count  - g_ai_agent.prev_free_count;
+    bool heap_grew = g_heap_stats.total_allocated > g_ai_agent.prev_heap_bytes;
+    bool evidence  = heap_grew && (alloc_delta > free_delta);
+
+    if (evidence) {
+        g_ai_agent.ml_alpha++;
+        g_ai_agent.ml_consecutive_e++;
+    } else {
+        g_ai_agent.ml_beta++;
+        g_ai_agent.ml_consecutive_e = 0;
+    }
+
+    /* Decay for NON-STATIONARITY: kernel workload changes over time, so stale
+     * evidence must fade or the posterior freezes and stops tracking reality.
+     * Every ML_DECAY_WINDOWS windows we halve both counters (integer division,
+     * floored at 1) — an exponential forgetting factor that preserves the
+     * ratio P while keeping the estimator responsive to recent behavior. */
+    if (++g_ai_agent.ml_windows >= ML_DECAY_WINDOWS) {
+        g_ai_agent.ml_windows = 0;
+        g_ai_agent.ml_alpha = g_ai_agent.ml_alpha > 1 ? g_ai_agent.ml_alpha / 2 : 1;
+        g_ai_agent.ml_beta  = g_ai_agent.ml_beta  > 1 ? g_ai_agent.ml_beta  / 2 : 1;
+    }
+
+    uint32_t ml_total    = g_ai_agent.ml_alpha + g_ai_agent.ml_beta;
+    uint32_t ml_permille = (g_ai_agent.ml_alpha * 1000) / ml_total;
+
+    /* Decision rule v1: raise the Memory Leak anomaly only on SUSTAINED,
+     * PROBABLE evidence — at least 3 consecutive E-windows AND a measured
+     * posterior P above 60.0%. The trigger adapts: it depends on the run-length
+     * of consecutive evidence, not a single fixed threshold, and the 600 gate
+     * is on a probability we MEASURED rather than a confidence we invented. */
+    if (g_ai_agent.ml_consecutive_e >= 3 && ml_permille > 600) {
         g_ai_agent.anomalies[ANOMALY_MEMORY_LEAK] = true;
         g_ai_agent.anomalies_found++;
     }
@@ -116,6 +169,7 @@ void ai_agent_check_anomalies(void) {
     g_ai_agent.prev_free_count = g_heap_stats.free_count;
     g_ai_agent.prev_syscall_count = g_syscall_stats.total;
     g_ai_agent.prev_error_count = g_ata_disk.total_errors;
+    g_ai_agent.prev_heap_bytes = g_heap_stats.total_allocated;
 }
 
 /* === Prediction Engine === */
@@ -215,6 +269,19 @@ void ai_agent_status(void) {
         }
     }
     if (!any) vga_puts_color("None", VGA_LIGHT_GREEN, VGA_BLACK);
+    vga_puts("\n");
+
+    /* Memory-leak Bayesian node: show the MEASURED posterior, not a hand-picked
+     * confidence. P = alpha/(alpha+beta) rendered as NN.N% from permille. */
+    uint32_t ml_total    = g_ai_agent.ml_alpha + g_ai_agent.ml_beta;
+    uint32_t ml_permille = (g_ai_agent.ml_alpha * 1000) / ml_total;
+    vga_puts_color("  MemLeak[Bayes]: ", VGA_WHITE, VGA_BLACK);
+    vga_puts("P=");
+    vga_put_dec(ml_permille / 10); vga_putchar('.');
+    vga_put_dec(ml_permille % 10); vga_puts("%  (a=");
+    vga_put_dec(g_ai_agent.ml_alpha); vga_puts(" b=");
+    vga_put_dec(g_ai_agent.ml_beta); vga_puts(") runE=");
+    vga_put_dec(g_ai_agent.ml_consecutive_e);
     vga_puts("\n");
 
     /* Current prediction */
