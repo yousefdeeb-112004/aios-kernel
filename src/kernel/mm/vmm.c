@@ -9,14 +9,54 @@
 #include <kernel/heap.h>
 #include <kernel/idt.h>
 #include <kernel/panic.h>
+#include <kernel/process.h>
 #include <drivers/vga.h>
 #include <lib/string.h>
+#include <ai/event_bus.h>
 
 static uint32_t page_dir[1024] __attribute__((aligned(4096)));
 static uint32_t first_pt[8][1024] __attribute__((aligned(4096)));
 vmm_stats_t g_vmm_stats;
 
-static void pf(registers_t* r) { g_vmm_stats.page_faults++; kpanic_exception(r); }
+/* Page-fault policy:
+ *   - A fault from Ring 3 kills ONLY the faulting process (SIGSEGV-style),
+ *     leaving the shell and every other process running.
+ *   - A fault from Ring 0 is a real kernel bug → panic (unchanged).
+ *
+ * "From Ring 3" is decided by the page-fault error code's U/S bit (bit 2):
+ * set means the faulting access was made in user mode. We cross-check the
+ * saved CS's RPL (cs & 3 == 3) — both are pushed in registers_t. */
+static void pf(registers_t* r) {
+    g_vmm_stats.page_faults++;
+
+    bool from_user = (r->err_code & 0x4) || ((r->cs & 3) == 3);
+    if (from_user) {
+        uint32_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        uint32_t pid = current_process ? current_process->pid : 0;
+
+        vga_puts_color("[SEGFAULT] pid=", VGA_LIGHT_RED, VGA_BLACK);
+        vga_put_dec(pid);
+        vga_puts_color(" killed: addr=", VGA_LIGHT_RED, VGA_BLACK);
+        vga_put_hex(cr2);
+        vga_puts_color(" eip=", VGA_LIGHT_RED, VGA_BLACK);
+        vga_put_hex(r->eip);
+        vga_puts_color(" err=", VGA_LIGHT_RED, VGA_BLACK);
+        vga_put_hex(r->err_code);
+        vga_putchar('\n');
+
+        /* Reuse the existing process-exit event (no new event types). */
+        ai_fire_event(AI_EVT_PROCESS_EXIT, pid, cr2);
+
+        /* Terminate only this process. proc_exit() marks it TERMINATED and
+         * schedule()s away; the scheduler frees its address space + stacks.
+         * Same ISR-safe path the timer uses to call schedule(). */
+        proc_exit();
+        return;   /* not reached for a real user process */
+    }
+
+    kpanic_exception(r);   /* Ring 0 fault: unchanged. */
+}
 
 void vmm_init(void) {
     memset(&g_vmm_stats, 0, sizeof(vmm_stats_t));

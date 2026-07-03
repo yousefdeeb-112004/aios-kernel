@@ -4,3 +4,8 @@ build/
 *.elf
 *.img
 *.zip
+
+# Claude Code local/personal + python cache
+.claude/settings.local.json
+__pycache__/
+*.pyc

@@ -61,4 +61,12 @@ int32_t elf_load_and_run(const char* filename);
 /* Validate an ELF header. Returns true if valid 32-bit x86 ELF. */
 bool elf_validate(const elf32_header_t* hdr);
 
+/* Ring-3 isolation self-test: run a tiny Ring 3 program that stores to a
+ * kernel address; it must be killed with [SEGFAULT] while the shell survives. */
+int32_t elf_run_segfault_test(void);
+
+/* Ring-3 syscall pointer-guard self-test: a Ring 3 SYS_WRITE with a kernel
+ * address must return -1 (nothing leaked) while the program keeps running. */
+int32_t elf_run_syscall_guard_test(void);
+
 #endif
