@@ -1,8 +1,12 @@
 /* =============================================================================
  * AI Agent Runtime (Tier 3.2)
  *
- * An intelligent agent that runs inside the kernel, observing system behavior
- * via the Phase 8 event bus and performance counters. It can:
+ * A rule-based agent with ONE Bayesian (Beta-Bernoulli) node: the memory-leak
+ * detector estimates a real conditional probability from sampled evidence,
+ * while every other detector remains a hand-tuned threshold rule.
+ *
+ * It runs inside the kernel, observing system behavior via the Phase 8 event
+ * bus and performance counters. It can:
  *
  *   1. Detect anomalies (memory leak, high error rate, idle too long)
  *   2. Predict developer actions (compile after edit, break after long session)
@@ -67,6 +71,15 @@ typedef struct {
     uint32_t prev_error_count;
     uint32_t idle_streak;       /* Consecutive idle samples */
     uint32_t busy_streak;       /* Consecutive busy samples */
+
+    /* --- Beta-Bernoulli memory-leak node (the one learned detector) ---------
+     * Posterior over "is memory leaking?" learned from per-window evidence.
+     * See ai_agent_check_anomalies() in agent.c ("decision rule v1"). */
+    uint32_t ml_alpha;          /* 1 + #windows evidence E held (Laplace)   */
+    uint32_t ml_beta;           /* 1 + #windows evidence E did NOT hold      */
+    uint32_t ml_consecutive_e;  /* run-length of consecutive E windows       */
+    uint32_t ml_windows;        /* windows observed since last decay         */
+    uint32_t prev_heap_bytes;   /* heap in-use bytes at the previous window  */
 } ai_agent_t;
 
 extern ai_agent_t g_ai_agent;
