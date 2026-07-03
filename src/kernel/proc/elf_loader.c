@@ -27,10 +27,11 @@
 
 #define USER_STACK_SIZE 4096
 
-/* User address-space layout (Ring 3). The program loads at 0x00500000
- * (see src/user/user.ld); the user stack sits at the top of the low private
- * region, clear of any plausible program size. */
-#define USER_STACK_TOP   0x00600000
+/* User address-space layout (Ring 3): USER_REGION_START (program load base) and
+ * USER_STACK_TOP (top of user stack) are defined in <kernel/usermode.h> so the
+ * ELF loader and the syscall pointer-validation code share one source of truth.
+ * The program loads at USER_REGION_START (see src/user/user.ld); the user stack
+ * sits at the top of the low private region, clear of any plausible program. */
 
 bool elf_validate(const elf32_header_t* hdr) {
     if (hdr->e_magic != ELF_MAGIC) {
@@ -216,6 +217,65 @@ static void elf_thread_fn(void) {
      * do NOT register the stack with proc_set_user_stack (that path kfree()s a
      * heap pointer; our stack is a PMM frame). */
     jump_to_usermode(entry_point, user_esp);
+}
+
+/* ---- Ring-3 isolation self-test (shell: sgf) --------------------------------
+ * Proves the page-fault policy: a Ring 3 store to a kernel address kills only
+ * the faulting process (SEGFAULT) while the shell stays alive. Builds a tiny
+ * private address space with the same primitives the ELF loader uses (the
+ * loader flow itself is untouched), drops a few bytes of machine code that
+ * store to 0x00100000 — a supervisor-only kernel page — and enters Ring 3. */
+#define SGF_CODE_VA USER_REGION_START   /* same 4MB user region as user.ld */
+
+static const uint8_t sgf_code[] = {
+    0xB8, 0xAD, 0xDE, 0x00, 0x00,   /* mov  $0x0000dead, %eax             */
+    0xA3, 0x00, 0x00, 0x10, 0x00,   /* mov  %eax, (0x00100000)  <- kernel */
+    0xEB, 0xFE                       /* 1: jmp 1b   (not reached)          */
+};
+
+static void sgf_thread_fn(void) {
+    uint32_t user_pd = vmm_create_address_space();
+    if (!user_pd) {
+        vga_puts_color("  SGF: address space alloc failed\n", VGA_LIGHT_RED, VGA_BLACK);
+        return;
+    }
+
+    uint32_t cframe = pmm_alloc_page();
+    uint32_t sframe = pmm_alloc_page();
+    if (!cframe || !sframe) {
+        vga_puts_color("  SGF: out of physical memory\n", VGA_LIGHT_RED, VGA_BLACK);
+        vmm_destroy_address_space(user_pd);
+        return;
+    }
+    vmm_map_user_page(user_pd, SGF_CODE_VA, cframe);
+    uint32_t ustack_page = USER_STACK_TOP - PAGE_SIZE;
+    vmm_map_user_page(user_pd, ustack_page, sframe);
+
+    current_process->page_dir = user_pd;
+    vmm_switch_address_space(user_pd);
+
+    memcpy((void*)SGF_CODE_VA, sgf_code, sizeof(sgf_code));
+    memset((void*)ustack_page, 0, PAGE_SIZE);
+
+    vga_puts_color("  Ring 3 will store to kernel 0x00100000 (must SEGFAULT)...\n",
+                   VGA_YELLOW, VGA_BLACK);
+
+    uint32_t kstack_top = current_process->stack_base + PROC_STACK_SIZE;
+    tss_set_kernel_stack(kstack_top);
+    jump_to_usermode(SGF_CODE_VA, USER_STACK_TOP - 16);
+}
+
+int32_t elf_run_segfault_test(void) {
+    vga_puts_color("=== Ring 3 isolation test (sgf) ===\n", VGA_LIGHT_CYAN, VGA_BLACK);
+    int32_t pid = proc_create("sgf_test", sgf_thread_fn, 128);
+    if (pid < 0) {
+        vga_puts_color("  Failed to create process\n", VGA_LIGHT_RED, VGA_BLACK);
+        return -1;
+    }
+    for (int i = 0; i < 30; i++) proc_yield();
+    pit_sleep_ms(300);
+    vga_puts("  sgf test complete (shell still alive).\n");
+    return 0;
 }
 
 int32_t elf_load_and_run(const char* filename) {
