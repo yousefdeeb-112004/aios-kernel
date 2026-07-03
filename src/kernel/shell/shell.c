@@ -317,6 +317,7 @@ static void cmd_help(void) {
     vga_puts_color("   fzh <1|2|3>  Panic test (div0/pgfault/manual)\n", VGA_YELLOW, VGA_BLACK);
     vga_puts_color("  Kernel:\n", VGA_WHITE, VGA_BLACK);
     vga_puts("   shgl <f> Run ELF (Ring 3, isolated)   jrb Preempt test\n");
+    vga_puts("   sgf  Ring 3 isolation test (SEGFAULT, shell survives)\n");
     vga_puts_color("  Disk (persistent):\n", VGA_WHITE, VGA_BLACK);
     vga_puts("   qrs  Disk info    qra <n> Read sect  hfz <n> <t> Write\n");
     vga_puts_color("   tnsyq Format disk  hfzk Sync VFS->disk\n", VGA_YELLOW, VGA_BLACK);
@@ -1462,6 +1463,8 @@ static void shell_exec(const char* line) {
         } else {
             elf_load_and_run(arg);
         }
+    } else if (strcmp(cmd, "sgf") == 0) {
+        elf_run_segfault_test();
     } else if (strcmp(cmd, "qrs") == 0) {
         cmd_qrs();
     } else if (strncmp(cmd, "qra", 3) == 0 && (cmd[3] == ' ' || cmd[3] == '\0')) {
