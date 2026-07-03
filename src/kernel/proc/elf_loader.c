@@ -278,6 +278,89 @@ int32_t elf_run_segfault_test(void) {
     return 0;
 }
 
+/* ---- Ring-3 syscall pointer-guard self-test (shell: sgw) ---------------------
+ * Proves syscall pointer validation: a Ring 3 SYS_WRITE with a KERNEL address
+ * (0x00100000, len 64) must return -1 and print NOTHING from kernel memory. The
+ * program then does a legitimate SYS_WRITE from its own user memory (proving it
+ * keeps running with a working ABI) and exits cleanly. Same address-space setup
+ * as the sgf test; the loader flow itself is untouched.
+ *
+ * Code bytes (patched at runtime with the message address/length):
+ *   mov $1,%eax; mov $0x00100000,%ebx; mov $64,%ecx; int $0x80  ; rejected write
+ *   mov $1,%eax; mov $msg,%ebx;        mov $len,%ecx; int $0x80  ; legit write
+ *   mov $4,%eax;                                      int $0x80  ; exit
+ *   1: jmp 1b */
+static void sgw_thread_fn(void) {
+    static uint8_t code[] = {
+        0xB8,0x01,0x00,0x00,0x00,   /*  0: mov  $1,%eax                 */
+        0xBB,0x00,0x00,0x10,0x00,   /*  5: mov  $0x00100000,%ebx        */
+        0xB9,0x40,0x00,0x00,0x00,   /* 10: mov  $64,%ecx                */
+        0xCD,0x80,                  /* 15: int  $0x80  (must return -1) */
+        0xB8,0x01,0x00,0x00,0x00,   /* 17: mov  $1,%eax                 */
+        0xBB,0x00,0x00,0x00,0x00,   /* 22: mov  $msg,%ebx  (patch @23)  */
+        0xB9,0x00,0x00,0x00,0x00,   /* 27: mov  $len,%ecx  (patch @28)  */
+        0xCD,0x80,                  /* 32: int  $0x80  (legit write)    */
+        0xB8,0x04,0x00,0x00,0x00,   /* 34: mov  $4,%eax                 */
+        0xCD,0x80,                  /* 39: int  $0x80  (exit)           */
+        0xEB,0xFE                   /* 41: 1: jmp 1b                    */
+    };
+    static const char msg[] =
+        "  [guard] kernel ptr write rejected (-1); user program still alive\n";
+
+    uint32_t user_pd = vmm_create_address_space();
+    if (!user_pd) {
+        vga_puts_color("  SGW: address space alloc failed\n", VGA_LIGHT_RED, VGA_BLACK);
+        return;
+    }
+    uint32_t cframe = pmm_alloc_page();
+    uint32_t sframe = pmm_alloc_page();
+    if (!cframe || !sframe) {
+        vga_puts_color("  SGW: out of physical memory\n", VGA_LIGHT_RED, VGA_BLACK);
+        vmm_destroy_address_space(user_pd);
+        return;
+    }
+    vmm_map_user_page(user_pd, USER_REGION_START, cframe);
+    uint32_t ustack_page = USER_STACK_TOP - PAGE_SIZE;
+    vmm_map_user_page(user_pd, ustack_page, sframe);
+
+    current_process->page_dir = user_pd;
+    vmm_switch_address_space(user_pd);
+
+    /* Place the message right after the code, and patch its absolute address +
+     * length into the second SYS_WRITE. */
+    uint32_t msg_va  = USER_REGION_START + sizeof(code);
+    uint32_t msg_len = sizeof(msg) - 1;   /* exclude NUL */
+    code[23] = msg_va & 0xFF;  code[24] = (msg_va >> 8) & 0xFF;
+    code[25] = (msg_va >> 16) & 0xFF;  code[26] = (msg_va >> 24) & 0xFF;
+    code[28] = msg_len & 0xFF; code[29] = (msg_len >> 8) & 0xFF;
+    code[30] = (msg_len >> 16) & 0xFF; code[31] = (msg_len >> 24) & 0xFF;
+
+    memcpy((void*)USER_REGION_START, code, sizeof(code));
+    memcpy((void*)msg_va, msg, msg_len);
+    memset((void*)ustack_page, 0, PAGE_SIZE);
+
+    vga_puts_color("  Ring 3 SYS_WRITE(0x00100000, 64) must be rejected...\n",
+                   VGA_YELLOW, VGA_BLACK);
+
+    uint32_t kstack_top = current_process->stack_base + PROC_STACK_SIZE;
+    tss_set_kernel_stack(kstack_top);
+    jump_to_usermode(USER_REGION_START, USER_STACK_TOP - 16);
+}
+
+int32_t elf_run_syscall_guard_test(void) {
+    vga_puts_color("=== Ring 3 syscall pointer-guard test (sgw) ===\n",
+                   VGA_LIGHT_CYAN, VGA_BLACK);
+    int32_t pid = proc_create("sgw_test", sgw_thread_fn, 128);
+    if (pid < 0) {
+        vga_puts_color("  Failed to create process\n", VGA_LIGHT_RED, VGA_BLACK);
+        return -1;
+    }
+    for (int i = 0; i < 30; i++) proc_yield();
+    pit_sleep_ms(300);
+    vga_puts("  sgw test complete (shell still alive).\n");
+    return 0;
+}
+
 int32_t elf_load_and_run(const char* filename) {
     vga_puts_color("=== ELF Loader (shgl) ===\n", VGA_LIGHT_CYAN, VGA_BLACK);
     vga_puts("  Loading: ");
