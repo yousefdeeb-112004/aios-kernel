@@ -1,4 +1,4 @@
-# AIOS System Call ABI — v1.1
+# AIOS System Call ABI — v1.2
 
 This document is the frozen contract between Ring 3 user programs and the AIOS
 kernel. Every entry below is verified against the source:
@@ -12,6 +12,12 @@ kernel. Every entry below is verified against the source:
 
 ### Changelog
 
+- **v1.2** — added `SYS_AISTAT` (14): a read-only snapshot of the kernel AI
+  agent's Bayesian nodes into a user `ai_stat_t`. Numbers 1–13 are unchanged.
+  `ai_stat_t` is itself **versioned and append-only**: it carries a `version`
+  field (currently 1), and future revisions may only **add fields at the end**
+  and bump the version — existing field offsets and meanings never change, so
+  an old program keeps reading the prefix it knows.
 - **v1.1** — added `SYS_OPEN` (11), `SYS_FREAD` (12), `SYS_FCLOSE` (13):
   read-only VFS file access for Ring 3. `EDX` is now a real third argument
   (it was reserved in v1). Numbers 1–10 are unchanged.
@@ -54,13 +60,25 @@ kernel. Every entry below is verified against the source:
 | 11 | `SYS_OPEN` *(v1.1)* | `const char* path` | — | fd `>= 3` on success. `-1` bad path pointer, `-2` no such file (or it is a directory), `-3` the process's fd table is full. **Read-only.** |
 | 12 | `SYS_FREAD` *(v1.1)* | `int fd` | `char* buf` | bytes read, **`0` at EOF**. `-1` bad buffer, `-2` bad fd. Third argument `uint32_t len` in **`EDX`**. |
 | 13 | `SYS_FCLOSE` *(v1.1)* | `int fd` | — | `0` on success; `-2` bad fd. |
+| 14 | `SYS_AISTAT` *(v1.2)* | `ai_stat_t* out` | — | `0` on success; `-1` if the pointer is NULL/out-of-region. Fills `out`. **Read-only** — snapshots agent state, never mutates it. |
 
-`SYS_MAX` = 14 (one past the last valid number). Any `EAX` ≥ `SYS_MAX` or
+`SYS_MAX` = 15 (one past the last valid number). Any `EAX` ≥ `SYS_MAX` or
 otherwise unhandled returns `-1` and increments the invalid-syscall counter.
 
 `system_stats_t` (from `include/kernel/syscall.h`) is eight `uint32_t` fields:
 `uptime_seconds, total_ticks, free_pages, used_pages, heap_allocated,
 active_processes, total_ctx_switches, total_syscalls`.
+
+`ai_stat_t` (from `include/kernel/syscall.h`, mirrored manually in
+`src/user/lib/syscalls.h`) is a **frozen, versioned** struct — ten `uint32_t`
+fields at v1: `version` (= `AI_STAT_VERSION`, currently 1); then for node 1
+(memory-leak) `n1_alpha, n1_beta, n1_permille, n1_run_e`; for node 2
+(syscall-spike) `n2_alpha, n2_beta, n2_permille, n2_run_e`; and `anomalies`, a
+bitmask where bit *i* is set iff anomaly *i* (`anomaly_type_t`) is currently
+active. `permille` is the posterior mean `alpha*1000/(alpha+beta)` (integer;
+no floats cross the ABI). New fields only ever **append** and bump `version`.
+`SYS_AISTAT` validates `out` with the same `user_range_ok` gate as
+`SYS_GETSTATS`, so a kernel or out-of-region pointer returns `-1`.
 
 ## Pointer rules (user-mode)
 
@@ -76,7 +94,8 @@ caller is Ring 3** (decided by the saved CS privilege level, `cs & 3 == 3`):
 
 Validated buffer arguments: `SYS_WRITE` (buf), `SYS_READ` (buf), `SYS_GETSTATS`
 (out), `SYS_SIGNAL` (handler entry point, unless it is the `SIG_DFL`/`SIG_IGN`
-sentinel), and **`SYS_FREAD` (buf, checked against the `EDX` length)**. The
+sentinel), **`SYS_FREAD` (buf, checked against the `EDX` length)**, and
+**`SYS_AISTAT` (out, checked for `sizeof(ai_stat_t)`)**. The
 region constants `USER_REGION_START` and `USER_STACK_TOP` are defined in
 `include/kernel/usermode.h` and shared by the ELF loader and the syscall
 validator.
