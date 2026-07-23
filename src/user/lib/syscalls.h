@@ -34,6 +34,8 @@
 #define SYS_OPEN     11
 #define SYS_FREAD    12
 #define SYS_FCLOSE   13
+/* --- ABI v1.2: read-only AI-agent snapshot -------------------------------- */
+#define SYS_AISTAT   14
 
 /* Signal handler sentinels (ABI.md, SYS_SIGNAL row). */
 #define SIG_DFL ((void (*)(int))0)
@@ -89,5 +91,22 @@ int32_t  sys_fread(int32_t fd, char* buf, uint32_t len);
 
 /* Returns 0, or -2 for a bad fd. */
 int32_t  sys_fclose(int32_t fd);
+
+/* Filled by ai_stat(). This is a MANUAL MIRROR of the kernel's ai_stat_t in
+ * include/kernel/syscall.h — keep the two byte-for-byte identical. The struct
+ * is frozen and versioned (append-only): only ever add fields at the END and
+ * bump AI_STAT_VERSION; never reorder or resize existing fields. */
+#define AI_STAT_VERSION 1
+typedef struct {
+    uint32_t version;                                  /* = AI_STAT_VERSION     */
+    uint32_t n1_alpha, n1_beta, n1_permille, n1_run_e; /* node 1: memory-leak   */
+    uint32_t n2_alpha, n2_beta, n2_permille, n2_run_e; /* node 2: syscall-spike */
+    uint32_t anomalies;   /* bit i set iff kernel anomaly i is active           */
+} ai_stat_t;
+
+/* Read-only snapshot of the kernel AI agent's Bayesian nodes into *out.
+ * Returns 0 on success, -1 on a bad/out-of-region pointer. Purely observational
+ * — Ring 3 cannot influence the agent through this call. */
+int32_t  ai_stat(ai_stat_t* out);
 
 #endif /* _LIBAIOS_SYSCALLS_H */

@@ -1,9 +1,11 @@
 /* =============================================================================
  * AI Agent Runtime (Tier 3.2)
  *
- * A rule-based agent with ONE Bayesian (Beta-Bernoulli) node: the memory-leak
- * detector estimates a real conditional probability from sampled evidence,
- * while every other detector remains a hand-tuned threshold rule.
+ * A rule-based agent with a small BAYESIAN NETWORK: two evidence nodes
+ * (memory-leak and syscall-spike, each a Beta-Bernoulli posterior over sampled
+ * evidence) feed one derived SYSTEM_STRESS node modelled as a 2x2 learned CPT
+ * — P(stress | E1, E2) over four Beta-Bernoulli cells. Every other detector
+ * remains a hand-tuned threshold rule.
  *
  * It runs inside the kernel, observing system behavior via the Phase 8 event
  * bus and performance counters. It can:
@@ -35,6 +37,7 @@ typedef enum {
     ANOMALY_LONG_IDLE,          /* developer idle > threshold */
     ANOMALY_HEAP_FRAGMENTED,    /* many allocs, low free block size */
     ANOMALY_EVENT_STORM,        /* too many events per second */
+    ANOMALY_SYSTEM_STRESS,      /* derived: P(stress|E1,E2) from the 2x2 CPT */
     ANOMALY_MAX
 } anomaly_type_t;
 
@@ -47,6 +50,16 @@ typedef enum {
     PREDICT_IDLE_SOON,          /* activity winding down */
     PREDICT_MAX
 } prediction_type_t;
+
+/* One Beta-Bernoulli node: a Beta(alpha,beta) posterior over a binary per-window
+ * event, updated with Laplace smoothing (alpha=beta=1 prior) and exponential
+ * forgetting. Shared by every LEARNED detector so their machinery is identical. */
+typedef struct {
+    uint32_t alpha;   /* 1 + #windows the evidence held (Laplace smoothing) */
+    uint32_t beta;    /* 1 + #windows the evidence did NOT hold             */
+    uint32_t run_e;   /* run-length of consecutive evidence windows         */
+    uint32_t windows; /* windows observed since the last decay              */
+} bayes_node_t;
 
 /* AI Agent state */
 typedef struct {
@@ -72,14 +85,28 @@ typedef struct {
     uint32_t idle_streak;       /* Consecutive idle samples */
     uint32_t busy_streak;       /* Consecutive busy samples */
 
-    /* --- Beta-Bernoulli memory-leak node (the one learned detector) ---------
-     * Posterior over "is memory leaking?" learned from per-window evidence.
-     * See ai_agent_check_anomalies() in agent.c ("decision rule v1"). */
-    uint32_t ml_alpha;          /* 1 + #windows evidence E held (Laplace)   */
-    uint32_t ml_beta;           /* 1 + #windows evidence E did NOT hold      */
-    uint32_t ml_consecutive_e;  /* run-length of consecutive E windows       */
-    uint32_t ml_windows;        /* windows observed since last decay         */
-    uint32_t prev_heap_bytes;   /* heap in-use bytes at the previous window  */
+    /* --- Beta-Bernoulli nodes (the LEARNED detectors) -----------------------
+     * Two posterior-probability nodes, each P = alpha/(alpha+beta) learned from
+     * per-window binary evidence; see ai_agent_check_anomalies() in agent.c
+     * ("decision rule v1"). Every OTHER detector stays a hand-tuned rule.
+     *   ml — memory leak    (evidence: heap grew AND allocs outpaced frees)
+     *   sc — syscall spike  (evidence: this window's syscall delta exceeded a
+     *        baseline learned from the running mean of previous deltas) */
+    bayes_node_t ml;
+    bayes_node_t sc;
+    uint32_t prev_heap_bytes;   /* heap in-use bytes at the previous window   */
+    uint32_t sc_ema_scaled;     /* SC_EMA_N x running mean of prior sc deltas */
+
+    /* --- Derived hypothesis: SYSTEM_STRESS as a 2x2 learned CPT --------------
+     * The first CONDITIONAL structure — a minimal Bayesian network. The two
+     * evidence nodes above are the PARENTS; this node learns P(stress|E1,E2) as
+     * four Beta-Bernoulli cells, indexed (E1<<1)|E2, one per parent combination.
+     * Each window exactly one cell updates with the slowdown-proxy label; the
+     * reported P(stress) is that selected cell's posterior. See agent.c. */
+    bayes_node_t cpt[4];        /* cells for (E1,E2) in {00,01,10,11}         */
+    uint32_t idle_ema_scaled;   /* IDLE_EMA_N x running mean of cpu_idle_pct  */
+    uint32_t stress_run;        /* consecutive windows the slowdown label held */
+    uint32_t stress_idx;        /* CPT cell selected by the latest window      */
 } ai_agent_t;
 
 extern ai_agent_t g_ai_agent;

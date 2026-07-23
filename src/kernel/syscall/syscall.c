@@ -5,6 +5,7 @@
 #include <kernel/heap.h>
 #include <kernel/usermode.h>
 #include <kernel/vfs.h>
+#include <ai/agent.h>
 #include <drivers/vga.h>
 #include <drivers/keyboard.h>
 #include <drivers/pit.h>
@@ -186,6 +187,36 @@ static void sh(registers_t* r) {
             if (vfd < 0) { r->eax = (uint32_t)-2; break; }   /* bad fd */
             vfs_close(vfd);
             proc_close_fd((int32_t)a1);
+            r->eax = 0;
+            break;
+        }
+        /* --- ABI v1.2: read-only AI-agent snapshot ------------------------
+         * Fills *out with a frozen ai_stat_t. READ-ONLY: it copies the two
+         * Bayesian nodes' counters and the anomaly bitmask and does NOTHING
+         * else — it never advances a window or touches agent state, so a Ring
+         * 3 reader has zero influence over what the agent learns. Same pointer
+         * gate as SYS_GETSTATS: a kernel/out-of-region pointer returns -1. */
+        case SYS_AISTAT: {
+            if (from_user && !user_range_ok(a1, sizeof(ai_stat_t))) {
+                r->eax = (uint32_t)-1; break;
+            }
+            ai_stat_t* out = (ai_stat_t*)a1;
+            if (!out) { r->eax = (uint32_t)-1; break; }
+            out->version    = AI_STAT_VERSION;
+            out->n1_alpha   = g_ai_agent.ml.alpha;
+            out->n1_beta    = g_ai_agent.ml.beta;
+            out->n1_permille= (g_ai_agent.ml.alpha * 1000) /
+                              (g_ai_agent.ml.alpha + g_ai_agent.ml.beta);
+            out->n1_run_e   = g_ai_agent.ml.run_e;
+            out->n2_alpha   = g_ai_agent.sc.alpha;
+            out->n2_beta    = g_ai_agent.sc.beta;
+            out->n2_permille= (g_ai_agent.sc.alpha * 1000) /
+                              (g_ai_agent.sc.alpha + g_ai_agent.sc.beta);
+            out->n2_run_e   = g_ai_agent.sc.run_e;
+            uint32_t mask = 0;
+            for (int i = 0; i < ANOMALY_MAX; i++)
+                if (g_ai_agent.anomalies[i]) mask |= (1u << i);
+            out->anomalies = mask;
             r->eax = 0;
             break;
         }

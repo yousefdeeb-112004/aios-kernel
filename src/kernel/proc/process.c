@@ -649,12 +649,13 @@ int32_t proc_waitpid(uint32_t pid, int32_t* status) {
     if (!child) return -2; /* Not found */
     if (child->parent_pid != current_process->pid) return -3; /* Not our child */
 
-    /* Spin-wait for child to terminate */
-    uint32_t timeout = 0;
+    /* Block (yield-only) until the child terminates. No spin-count timeout: a
+     * foreground child may be a long-lived interactive program (the nawa REPL),
+     * and an arbitrary yield budget would return early and leave two live
+     * keyboard consumers. The SEGFAULT page-fault path calls proc_exit(), so a
+     * killed child still reaches PROC_TERMINATED and this loop completes. */
     while (child->state != PROC_TERMINATED && child->state != PROC_UNUSED) {
         proc_yield();
-        timeout++;
-        if (timeout > 100000) return -4; /* Timeout */
         child = proc_find(pid);
         if (!child) break;
     }

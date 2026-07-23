@@ -118,3 +118,12 @@ int32_t sys_fclose(int32_t fd) {
                      : "a"(SYS_FCLOSE), "b"(fd));
     return r;
 }
+
+int32_t ai_stat(ai_stat_t* out) {
+    int32_t r;
+    __asm__ volatile("int $0x80"
+                     : "=a"(r)
+                     : "a"(SYS_AISTAT), "b"(out)
+                     : "memory");
+    return r;
+}

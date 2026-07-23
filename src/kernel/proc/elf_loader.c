@@ -279,6 +279,16 @@ static void sgf_thread_fn(void) {
     jump_to_usermode(SGF_CODE_VA, USER_STACK_TOP - 16);
 }
 
+/* Foreground wait shared by shgl and every Ring-3 self-test: block until the
+ * created process terminates, reusing the kernel's proc_waitpid (yield-only, so
+ * no keyboard is consumed while blocked). Works for cleanly-exiting programs and
+ * for SEGFAULT-killed ones alike, since the page-fault path terminates the
+ * process via proc_exit(). */
+static void elf_wait_foreground(int32_t pid) {
+    int32_t status = 0;
+    proc_waitpid((uint32_t)pid, &status);
+}
+
 int32_t elf_run_segfault_test(void) {
     vga_puts_color("=== Ring 3 isolation test (sgf) ===\n", VGA_LIGHT_CYAN, VGA_BLACK);
     int32_t pid = proc_create("sgf_test", sgf_thread_fn, 128);
@@ -286,8 +296,7 @@ int32_t elf_run_segfault_test(void) {
         vga_puts_color("  Failed to create process\n", VGA_LIGHT_RED, VGA_BLACK);
         return -1;
     }
-    for (int i = 0; i < 30; i++) proc_yield();
-    pit_sleep_ms(300);
+    elf_wait_foreground(pid);
     vga_puts("  sgf test complete (shell still alive).\n");
     return 0;
 }
@@ -392,8 +401,7 @@ int32_t elf_run_syscall_guard_test(void) {
         vga_puts_color("  Failed to create process\n", VGA_LIGHT_RED, VGA_BLACK);
         return -1;
     }
-    for (int i = 0; i < 30; i++) proc_yield();
-    pit_sleep_ms(300);
+    elf_wait_foreground(pid);
     vga_puts("  sgw test complete (shell still alive).\n");
     return 0;
 }
@@ -533,8 +541,7 @@ int32_t elf_run_sbrk_test(void) {
         vga_puts_color("  Failed to create process\n", VGA_LIGHT_RED, VGA_BLACK);
         return -1;
     }
-    for (int i = 0; i < 30; i++) proc_yield();
-    pit_sleep_ms(300);
+    elf_wait_foreground(pid);
 
     uint32_t free_after = g_pmm_stats.free_pages;
     vga_puts("  free_pages after:  ");
@@ -705,8 +712,7 @@ int32_t elf_run_file_test(void) {
         vga_puts_color("  Failed to create process\n", VGA_LIGHT_RED, VGA_BLACK);
         return -1;
     }
-    for (int i = 0; i < 30; i++) proc_yield();
-    pit_sleep_ms(300);
+    elf_wait_foreground(pid);
 
     uint32_t fds_after = g_vfs_stats.open_fds;
     vga_puts("  VFS open_fds after:  ");
@@ -739,11 +745,13 @@ int32_t elf_load_and_run(const char* filename) {
         return -1;
     }
 
-    /* Yield to let ELF thread run */
-    for (int i = 0; i < 30; i++) {
-        proc_yield();
-    }
-    pit_sleep_ms(300);
+    /* FOREGROUND: block until the ELF process terminates — normal exit,
+     * SYS_EXIT, or SEGFAULT kill (the page-fault path calls proc_exit(), so a
+     * killed child still reaches PROC_TERMINATED). Reuses the kernel's existing
+     * proc_waitpid, which waits by proc_yield() only: while blocked the shell
+     * consumes ZERO keyboard input, leaving an interactive user program (the
+     * nawa REPL) as the sole keyboard consumer. */
+    elf_wait_foreground(pid);
 
     vga_puts("  ELF program completed.\n");
     return 0;
