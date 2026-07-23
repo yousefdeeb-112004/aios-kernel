@@ -319,6 +319,8 @@ static void cmd_help(void) {
     vga_puts("   shgl <f> Run ELF (Ring 3, isolated)   jrb Preempt test\n");
     vga_puts("   sgf  Ring 3 isolation test (SEGFAULT, shell survives)\n");
     vga_puts("   sgw  Ring 3 syscall pointer-guard test (kernel ptr -> -1)\n");
+    vga_puts("   shb  Ring 3 sbrk test (user heap RW + over-limit -> -1)\n");
+    vga_puts("   shf  Ring 3 file test (open/fread/close + bad path -> -1)\n");
     vga_puts_color("  Disk (persistent):\n", VGA_WHITE, VGA_BLACK);
     vga_puts("   qrs  Disk info    qra <n> Read sect  hfz <n> <t> Write\n");
     vga_puts_color("   tnsyq Format disk  hfzk Sync VFS->disk\n", VGA_YELLOW, VGA_BLACK);
@@ -1468,6 +1470,10 @@ static void shell_exec(const char* line) {
         elf_run_segfault_test();
     } else if (strcmp(cmd, "sgw") == 0) {
         elf_run_syscall_guard_test();
+    } else if (strcmp(cmd, "shb") == 0) {
+        elf_run_sbrk_test();
+    } else if (strcmp(cmd, "shf") == 0) {
+        elf_run_file_test();
     } else if (strcmp(cmd, "qrs") == 0) {
         cmd_qrs();
     } else if (strncmp(cmd, "qra", 3) == 0 && (cmd[3] == ' ' || cmd[3] == '\0')) {

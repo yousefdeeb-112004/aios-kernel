@@ -11,6 +11,10 @@
 
 extern const uint8_t user_hello_elf[];
 extern const uint32_t user_hello_elf_len;
+extern const uint8_t user_uctest_elf[];
+extern const uint32_t user_uctest_elf_len;
+extern const uint8_t user_nawa_elf[];
+extern const uint32_t user_nawa_elf_len;
 
 static vfs_file_t ft[VFS_MAX_FILES];
 static vfs_fd_t fdt[VFS_MAX_OPEN];
@@ -113,6 +117,24 @@ void vfs_init(void) {
     vfs_create("hello.elf", user_hello_elf, user_hello_elf_len);
     ri = find_file("hello.elf");
     if (ri >= 0) ft[ri].readonly = true;
+
+    vfs_create("uctest.elf", user_uctest_elf, user_uctest_elf_len);
+    ri = find_file("uctest.elf");
+    if (ri >= 0) ft[ri].readonly = true;
+
+    vfs_create("nawa.elf", user_nawa_elf, user_nawa_elf_len);
+    ri = find_file("nawa.elf");
+    if (ri >= 0) ft[ri].readonly = true;
+
+    /* Bootstrap script for the nawa interpreter (shgl nawa.elf). Seeded as a
+     * plain text file exactly like readme.txt/notes.txt above, so it can be
+     * read and edited from the shell. */
+    vfs_create("boot.nw",
+        "\\ nawa bootstrap\n"
+        ": square dup * ;\n"
+        ": cube dup square * ;\n"
+        "5 cube .\n"
+        "cr\n", 0);
 }
 
 int32_t vfs_create(const char* name, const void* data, uint32_t size) {

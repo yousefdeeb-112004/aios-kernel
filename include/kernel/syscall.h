@@ -11,7 +11,11 @@
 #define SYS_KILL     8   /* Send signal to process */
 #define SYS_SIGNAL   9   /* Set signal handler */
 #define SYS_GETSTATS 10
-#define SYS_MAX      11
+/* --- ABI v1.1: read-only file access. Appended; numbers 1..10 never move. --- */
+#define SYS_OPEN     11  /* EBX=const char* path -> fd, or negative error   */
+#define SYS_FREAD    12  /* EBX=fd ECX=buf EDX=len -> bytes read (0 = EOF)  */
+#define SYS_FCLOSE   13  /* EBX=fd -> 0, or negative error                  */
+#define SYS_MAX      14
 typedef struct { uint32_t counts[SYS_MAX]; uint32_t total; uint32_t invalid; } syscall_stats_t;
 typedef struct { uint32_t uptime_seconds; uint32_t total_ticks; uint32_t free_pages; uint32_t used_pages; uint32_t heap_allocated; uint32_t active_processes; uint32_t total_ctx_switches; uint32_t total_syscalls; } system_stats_t;
 extern syscall_stats_t g_syscall_stats;
@@ -22,4 +26,7 @@ uint32_t sys_uptime(void); int sys_getstats(system_stats_t* stats);
 void* sys_sbrk(int32_t increment);
 int sys_kill(uint32_t pid, int signum);
 int sys_signal(int signum, void (*handler)(int));
+int sys_open(const char* path);
+int sys_fread(int fd, char* buf, uint32_t len);
+int sys_fclose(int fd);
 #endif

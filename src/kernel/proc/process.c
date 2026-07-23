@@ -16,6 +16,9 @@
 #include <kernel/log.h>
 #include <kernel/lock.h>
 #include <kernel/vmm.h>
+#include <kernel/pmm.h>
+#include <kernel/usermode.h>
+#include <kernel/vfs.h>
 #include <kernel/smp.h>
 #include <drivers/vga.h>
 #include <drivers/pit.h>
@@ -33,10 +36,59 @@ static spinlock_t sched_lock = SPINLOCK_INIT;
 
 static void schedule(void);
 
+static void reap_terminated(void);
+
 static void recycle_terminated(void) {
+    /* Release resources before the slot loses its TERMINATED marker, or the
+     * reaper would never see it again. */
+    reap_terminated();
     for (int i = 1; i < MAX_PROCESSES; i++) {
         if (pt[i].state == PROC_TERMINATED)
             pt[i].state = PROC_UNUSED;
+    }
+}
+
+/* Free the kernel stack, user stack, kmalloc heap and private address space of
+ * every process that has already exited and switched away.
+ *
+ * This must NOT be done from schedule()'s own frame: switch_context() swaps the
+ * kernel stack mid-function, so anything read after that call comes from the
+ * RESUMING process's frame, not ours. Scanning the process table instead is
+ * idempotent and stateless — it cannot lose a record no matter which process
+ * happens to run it, and re-running it is harmless because every field is
+ * cleared as it is released.
+ *
+ * Safe points: after the context switch (CR3 already points at the new process,
+ * so a dying address space is no longer live) and never for current_process. */
+/* Close VFS descriptors the process still had open. The per-process table is
+ * reset when its slot is reused, but the VFS fd it pointed at is a GLOBAL slot
+ * (VFS_MAX_OPEN = 32 system-wide), so a user program that exits without
+ * SYS_FCLOSE would pin one forever. Idempotent: cleared slots are skipped. */
+static void proc_release_fds(process_t* p) {
+    for (int i = 0; i < PROC_MAX_FDS; i++) {
+        if (p->fds[i].used && p->fds[i].type == FD_FILE && p->fds[i].target >= 0)
+            vfs_close(p->fds[i].target);
+        p->fds[i].used = false;
+        p->fds[i].type = FD_NONE;
+        p->fds[i].target = -1;
+    }
+}
+
+static void reap_terminated(void) {
+    for (int i = 1; i < MAX_PROCESSES; i++) {
+        process_t* p = &pt[i];
+        if (p->state != PROC_TERMINATED || p == current_process) continue;
+        proc_release_fds(p);
+        if (p->stack_base)     { kfree((void*)p->stack_base);     p->stack_base = 0; }
+        if (p->user_stack)     { kfree((void*)p->user_stack);     p->user_stack = 0; }
+        if (p->mem.heap_start) { kfree((void*)p->mem.heap_start); p->mem.heap_start = 0; }
+        if (p->page_dir && p->page_dir != vmm_get_kernel_page_dir()) {
+            /* Frees every PTE_USER frame in the private page table — program
+             * image, user stack AND sbrk heap pages — and returns the pool
+             * slot. See vmm_destroy_address_space(). */
+            vmm_destroy_address_space(p->page_dir);
+            p->page_dir = 0;
+        }
     }
 }
 
@@ -163,19 +215,6 @@ static void schedule(void) {
     process_t* old = current_process;
     process_t* nw = &pt[nx];
 
-    /* Save resources to free after context switch */
-    uint32_t old_stack = 0, old_ustack = 0, old_heap = 0, old_pgdir = 0;
-    if (old->state == PROC_TERMINATED && old->stack_base) {
-        old_stack = old->stack_base; old->stack_base = 0;
-        old_ustack = old->user_stack; old->user_stack = 0;
-        old_heap = old->mem.heap_start; old->mem.heap_start = 0;
-        /* Free address space if it's not the kernel's */
-        if (old->page_dir != vmm_get_kernel_page_dir()) {
-            old_pgdir = old->page_dir;
-            old->page_dir = 0;
-        }
-    }
-
     if (old->state == PROC_RUNNING) old->state = PROC_READY;
     old->cpu_id = 0xFF;
 
@@ -194,11 +233,9 @@ static void schedule(void) {
     switch_context(&old->esp, nw->esp);
     __asm__ volatile("sti");
 
-    /* Free old resources after we're on the new stack */
-    if (old_stack)  kfree((void*)old_stack);
-    if (old_ustack) kfree((void*)old_ustack);
-    if (old_heap)   kfree((void*)old_heap);
-    if (old_pgdir)  vmm_destroy_address_space(old_pgdir);
+    /* We are now on the resuming process's stack: `old` and any local we set
+     * before the switch are stale. Reap from the process table instead. */
+    reap_terminated();
 
     proc_check_signals();
 }
@@ -323,9 +360,88 @@ void proc_check_signals(void) {
 /* sbrk                                                                       */
 /* ========================================================================= */
 
+/* vmm_map_user_page backs exactly ONE page-directory slot per address space
+ * (see the KNOWN TRAP comment in vmm.c), so the whole user heap must share the
+ * program's 4MB slot. Verified here rather than assumed. */
+_Static_assert((USER_HEAP_START >> 22) == (USER_REGION_START >> 22) &&
+               ((USER_HEAP_MAX - 1u) >> 22) == (USER_REGION_START >> 22),
+               "user heap must live in the same 4MB PDE slot as the program");
+_Static_assert(USER_HEAP_START >= USER_REGION_START &&
+               USER_HEAP_MAX > USER_HEAP_START &&
+               USER_HEAP_MAX <= USER_STACK_TOP - 2u * PAGE_SIZE,
+               "user heap must leave a guard page below the user stack page");
+
+/* Ring 3 sbrk: the break is backed by fresh PMM frames mapped PTE_USER into
+ * the calling process's own page directory, so the returned pointer is really
+ * dereferenceable from user mode.
+ *
+ * Failure policy: NO ROLLBACK. If PMM runs dry part-way through a grow, the
+ * pages already mapped stay mapped and stay recorded in user_brk_mapped; the
+ * break is left untouched and -1 is returned. Nothing leaks — those frames are
+ * PTE_USER entries in the private page table, so vmm_destroy_address_space
+ * reclaims them at process exit, and a later successful sbrk reuses them
+ * instead of double-allocating the same virtual page.
+ *
+ * Shrink (increment < 0) moves the break down but does NOT unmap or free the
+ * pages above it (v1 simplification, documented in ABI.md). */
+static void* user_sbrk(int32_t increment) {
+    process_t*   p   = current_process;
+    proc_mem_t*  mem = &p->mem;
+
+    /* First touch: anchor the heap. The ELF loader also does this explicitly;
+     * this is the safety net for any other adopter of a user address space. */
+    if (mem->user_brk < USER_HEAP_START) {
+        mem->user_brk        = USER_HEAP_START;
+        mem->user_brk_mapped = USER_HEAP_START;
+    }
+
+    uint32_t old_break = mem->user_brk;
+    if (increment == 0) return (void*)old_break;
+
+    if (increment < 0) {
+        /* 0u - (uint32_t)increment is |increment| without signed-overflow UB. */
+        uint32_t dec = 0u - (uint32_t)increment;
+        uint32_t room = old_break - USER_HEAP_START;
+        mem->user_brk = (dec >= room) ? USER_HEAP_START : (old_break - dec);
+        mem->sbrk_calls++;
+        return (void*)old_break;
+    }
+
+    uint32_t inc       = (uint32_t)increment;
+    uint32_t new_break = old_break + inc;
+    if (new_break < old_break) return (void*)-1;        /* wrapped */
+    if (new_break > USER_HEAP_MAX) return (void*)-1;    /* would hit guard page */
+
+    /* Map every page the break newly crosses. user_brk_mapped is the exclusive
+     * end of what is already backed, so this is idempotent across retries. */
+    uint32_t need_top = (new_break + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+    while (mem->user_brk_mapped < need_top) {
+        uint32_t frame = pmm_alloc_page();
+        if (!frame) return (void*)-1;                   /* PMM exhausted */
+        uint32_t va = mem->user_brk_mapped;
+        vmm_map_user_page(p->page_dir, va, frame);
+        /* Zero through the new mapping (CR3 is this process's page directory),
+         * so a recycled frame never hands stale data to Ring 3. */
+        memset((void*)va, 0, PAGE_SIZE);
+        mem->user_brk_mapped = va + PAGE_SIZE;
+    }
+
+    mem->user_brk = new_break;
+    mem->total_allocated += inc;
+    mem->sbrk_calls++;
+    return (void*)old_break;
+}
+
 void* proc_sbrk(int32_t increment) {
     if (!current_process) return (void*)-1;
     proc_mem_t* mem = &current_process->mem;
+
+    /* A process with a private address space is (or is about to be) in Ring 3:
+     * give it a real user-accessible heap. Kernel threads share the kernel page
+     * directory and keep the kmalloc-backed path below, unchanged. */
+    if (current_process->page_dir &&
+        current_process->page_dir != vmm_get_kernel_page_dir())
+        return user_sbrk(increment);
 
     if (mem->heap_start == 0) {
         void* heap = kmalloc(16384);
@@ -399,6 +515,7 @@ int32_t proc_kill(uint32_t pid) {
             if (g_sched_stats.total_stopped > 0) g_sched_stats.total_stopped--;
         }
 
+        proc_release_fds(&pt[i]);
         if (pt[i].stack_base) { kfree((void*)pt[i].stack_base); pt[i].stack_base = 0; }
         if (pt[i].user_stack) { kfree((void*)pt[i].user_stack); pt[i].user_stack = 0; }
         if (pt[i].mem.heap_start) { kfree((void*)pt[i].mem.heap_start); pt[i].mem.heap_start = 0; }
@@ -505,6 +622,21 @@ void proc_close_fd(int32_t fd) {
     current_process->fds[fd].type = FD_NONE;
     current_process->fds[fd].target = -1;
     current_process->fds[fd].used = false;
+}
+
+/* Resolve a caller-supplied fd to its backing target, or -1.
+ *
+ * Ownership is structural: the table lives in the caller's own PCB, so a
+ * process can only ever name its own descriptors — there is no global fd space
+ * for it to reach into. On top of that this checks the index is in range, the
+ * slot is actually open, and it is of the expected kind (so Ring 3 cannot pass
+ * fd 0/1/2 — the FD_CONSOLE stdio slots — to a file syscall). */
+int32_t proc_fd_target(int32_t fd, fd_type_t type) {
+    if (!current_process) return -1;
+    if (fd < 0 || fd >= PROC_MAX_FDS) return -1;
+    proc_fd_t* e = &current_process->fds[fd];
+    if (!e->used || e->type != type || e->target < 0) return -1;
+    return e->target;
 }
 
 /* =========================================================================

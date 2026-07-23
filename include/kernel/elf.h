@@ -69,4 +69,15 @@ int32_t elf_run_segfault_test(void);
  * address must return -1 (nothing leaked) while the program keeps running. */
 int32_t elf_run_syscall_guard_test(void);
 
+/* Ring-3 sbrk self-test: a Ring 3 program grows its heap with SYS_SBRK, writes
+ * and reads back both ends of the allocation, and checks that an over-limit
+ * request is refused with -1. Reports PMM free_pages before/after. */
+int32_t elf_run_sbrk_test(void);
+
+/* Ring-3 file-access self-test: a Ring 3 program opens a VFS file, reads and
+ * hex-dumps its first 16 bytes, closes it, then checks that SYS_OPEN with a
+ * kernel-address path is rejected. Reports VFS open_fds before/after so the
+ * descriptor it deliberately leaks can be seen to be reclaimed on exit. */
+int32_t elf_run_file_test(void);
+
 #endif

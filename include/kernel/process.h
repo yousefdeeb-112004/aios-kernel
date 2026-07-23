@@ -37,6 +37,13 @@ typedef struct {
     uint32_t heap_max;         /* Maximum break allowed */
     uint32_t total_allocated;  /* Total bytes allocated via sbrk */
     uint32_t sbrk_calls;       /* Number of sbrk calls */
+    /* --- Ring 3 heap (processes with a private address space) --------------
+     * heap_start/heap_break/heap_max above describe the KERNEL (kmalloc) heap
+     * used by kernel-thread sbrk callers. A process running in Ring 3 gets a
+     * real user-accessible heap instead, tracked here and backed by PMM frames
+     * mapped PTE_USER into its own page directory (see proc_sbrk). */
+    uint32_t user_brk;         /* Current Ring 3 break (0 = not initialized) */
+    uint32_t user_brk_mapped;  /* Exclusive end of the pages actually mapped  */
 } proc_mem_t;
 
 /* Per-process signal state */
@@ -122,6 +129,9 @@ int32_t proc_waitpid(uint32_t pid, int32_t* status);
 void proc_init_fds(process_t* p);   /* Set up stdin/stdout/stderr */
 int32_t proc_alloc_fd(fd_type_t type, int32_t target);
 void proc_close_fd(int32_t fd);
+/* Validate a caller-supplied fd (range + open + expected type) and return its
+ * backing target, or -1. Only ever looks at the CALLING process's table. */
+int32_t proc_fd_target(int32_t fd, fd_type_t type);
 
 extern void switch_context(uint32_t* old_esp, uint32_t new_esp);
 #endif
